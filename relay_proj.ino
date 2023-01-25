@@ -183,7 +183,7 @@ void r1_task (void *pvParameters)
         lcd.setCursor(0, 1);
         lcd.print(temp);
       } else {ini_flag[1] = 1;}
-      while(gpio_get_level((gpio_num_t)pin[1])) {vTaskDelay(25+3);}
+      while(gpio_get_level((gpio_num_t)pin[1])) {vTaskDelay(QNT_RELE+3);}
     }
     vTaskDelay(QNT_RELE+3);
   }
