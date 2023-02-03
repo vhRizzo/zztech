@@ -52,10 +52,14 @@ uint8_t pin[QNT_RELE] = {14, 27, 26, 25, 33, 32};       // Pinos dos Reles
 File post;                                              // Variavel para o arquivo de dados
 File conf;                                              // Variavel para o arquivo de configuracao
 time_t seg;                                             // Variavel necessaria para consultar a data/hora
+String str0;
+String str1;
+uint8_t ctrl;
 bool def_msg = 1;                                       // Controle de mensagem padrao para ser exibida no display
 bool server_auth;                                       // Controle de autenticacao de servidor
 bool suspended = 0;                                     // Controle para quando estiver configurando a maquina
 struct tm *timeinfo;                                    // Struct que facilita a selecao das informacoes da data/hora
+volatile bool scroll = 0;
 String DEFAULT_AP = "ZZTECH_MONITOR";                   // Nome padrao da maquina
 bool ini_flag[QNT_RELE] = {0, 0, 0, 0, 0, 0};           // Indicador para evitar que o programa indique que o estado inicial do rele seja um evento
 bool used_rele[QNT_RELE] = {1, 1, 1, 1, 1, 1};          // Controle de quais reles serao usados
@@ -280,6 +284,7 @@ const char confok_html[] PROGMEM = R"rawliteral(
 
 /* Prototipos de funcoes */
 void notFound(AsyncWebServerRequest *request);
+void scroll_msg (void *pvParameters);
 void conf_task (void *pvParameters);
 void time_task (void *pvParameters);
 void wifi_task (void *pvParameters);  TaskHandle_t wifi_handle;
@@ -292,8 +297,8 @@ void r3_task (void *pvParameters);
 void r4_task (void *pvParameters);
 void r5_task (void *pvParameters);
 void set_sdcard ();
-void get_conf();
 void sd_error ();
+void get_conf();
 
 void setup()
 {
@@ -312,19 +317,11 @@ void setup()
     }
     lcd.setCursor(0, 0);
     lcd.print("MODO CONF LIGADO");
-    /* Rotina para dar o efeito de scroll ao lcd (a lib possui uma funcao que faz essa tarefa, mas nao em apenas uma das linhas) */
-    int i = 16;
-    String aviso = "                DESLIGUE O MODO CONF DURANTE A INICIALIZACAO                ";
-    int rst = aviso.length()-16;
-    while(!digitalRead(CONF_PIN))
-    {
-      if (i > rst) i = 0;
-      lcd.setCursor(0, 1);
-      lcd.print(aviso.substring(i, i+16));
-      if (i == 16) delay(1000);
-      else delay(250);
-      i++;
-    } // E prende o programa em um loop ate que o switch seja desligado
+    str1 = "DESLIGUE O MODO CONF DURANTE A INICIALIZACAO";
+    ctrl = 1;
+    scroll = 1;
+    xTaskCreate(scroll_msg, "Scroll_LCD", 1024*4, NULL, configMAX_PRIORITIES - 15, NULL);
+    while(!digitalRead(CONF_PIN)) {if (digitalRead(CONF_PIN)) scroll = 0;} // E prende o programa em um loop ate que o switch seja desligado
   }
 
   /* Inicializa o Cartao SD */
@@ -358,9 +355,10 @@ void setup()
 
 void conf_task (void *pvParameters)
 {
+  char aux[17];
   while (1)
   {
-    if (!digitalRead(CONF_PIN)) // Caso o switch de configuracao seja acionado
+    if (!digitalRead(CONF_PIN)) // Caso o botao de configuracao seja acionado
     {
       vTaskSuspend(wifi_handle);// Suspende as tasks de wifi, http, e  lcd
       vTaskSuspend(http_handle);
@@ -373,19 +371,25 @@ void conf_task (void *pvParameters)
       if (nome_maq.isEmpty())   // Verifica se o campo de nome da maquina esta vazio
         nome_maq = DEFAULT_AP;  // Caso esteja, define ele como o nome padrao
       WiFi.softAP(nome_maq.c_str(), AP_PASS); // Inicia o ponto de acesso WiFi
+      ctrl = 1;
       lcd.setCursor(0, 0);
-      lcd.print(" MODO DE CONFIG ");
-      lcd.setCursor(0, 1);
-      lcd.print(" ACESSE O WIFI  ");
+      lcd.print("MODO CONF LIGADO");
+      str1 = "ACESSE O WIFI GERADO PELA MAQUINA";
+      scroll = 1;
+      xTaskCreate(scroll_msg, "Scroll_LCD", 1024*4, NULL, configMAX_PRIORITIES - 15, NULL);
       vTaskDelay(10000/portTICK_PERIOD_MS);
+      scroll = 0;
+      vTaskDelay(1000/portTICK_PERIOD_MS);
       if (serial_debug) {
         Serial.printf("Ponto de acesso WiFi gerado.\nAcesse com as credenciais abaixo para configurar a maquina\n");
         Serial.printf("SSID: %s\nSenha: %s\n\n", nome_maq.c_str(), AP_PASS);
       }
+      sprintf(aux, "%16s", nome_maq.c_str());
       lcd.setCursor(0, 0);
-      lcd.print(nome_maq.c_str());
+      lcd.print(aux);
       lcd.setCursor(0, 1);
-      lcd.print(AP_PASS);
+      sprintf(aux, "%16s", AP_PASS);
+      lcd.print(aux);
       IPAddress IP = WiFi.softAPIP(); // Gera o endereco IP do ESP32
 
       /* Gera a pagina html de configuracao */
@@ -396,10 +400,14 @@ void conf_task (void *pvParameters)
         Serial.print("Apos conectar ao ponto de acesso, abra seu navegador e acesse o seguinte endereco: ");
         Serial.println(IP); Serial.println();
       }
-      lcd.setCursor(0, 0);
-      lcd.print("ABRA NO BROWSER ");
+      vTaskDelay(30000/portTICK_PERIOD_MS);
+      ctrl = 0;
+      str0 = "ABRA O SEGUINTE ENDERECO NO SEU NAVEGADOR";
+      scroll = 1;
+      xTaskCreate(scroll_msg, "Scroll_LCD", 1024*4, NULL, configMAX_PRIORITIES - 15, NULL);
       lcd.setCursor(0, 1);
-      lcd.print(IP);
+      sprintf(aux, "%16s", IP.toString().c_str());
+      lcd.print(aux);
 
       /* Recebe os parametros passados pelo usuario e os salva em suas respectivas variaveis */
       server.on("/get", HTTP_GET, [] (AsyncWebServerRequest *request) {
@@ -610,7 +618,8 @@ void r0_task (void *pvParameters)
         aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"ESP Ligando - Rele Desativado\",\"horario\":\"" + temp + "\"}";
         ini_flag[ind] = 1;
       }
-      aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Desativado\",\"horario\":\"" + temp + "\"}";
+      else
+        aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Desativado\",\"horario\":\"" + temp + "\"}";
       post = SD.open(POST_DIR, FILE_APPEND);  // Abreo arquivo em modo de "append" (escrita apenas no final)
       post.println(aux);            // Escreve os dados no arquivo
       post.close();                 // Fecha o arquivo
@@ -618,6 +627,7 @@ void r0_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
+        if(marcaOff[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS); // Verifica se uma mensagem não acabou de ser exibida no lcd. Caso tenha, aguarda um pequeno tempo
         lcd_timer = marcaOff[ind];  // Atribui esse tempo para o timer do LCD (isso indicara para a task do LCD que ele deve esperar o tempo de timeout antes de exibir a mensagem padrao novamente)
         lcd.clear();                // E exibe a informacao de que o rele foi desativado, bem como o horario de sua desativacao
         lcd.setCursor(0,0);
@@ -638,7 +648,8 @@ void r0_task (void *pvParameters)
         aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"ESP Ligando - Rele Ativado\",\"horario\":\"" + temp + "\"}";
         ini_flag[ind] = 1;
       }
-      aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Ativado\",\"horario\":\"" + temp + "\"}";
+      else
+        aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Ativado\",\"horario\":\"" + temp + "\"}";
       post = SD.open(POST_DIR, FILE_APPEND);
       post.println(aux);
       post.close();
@@ -646,6 +657,7 @@ void r0_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
+        if(marcaOn[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
         lcd_timer = marcaOn[ind];
         lcd.clear();
         lcd.setCursor(0,0);
@@ -684,7 +696,8 @@ void r1_task (void *pvParameters)
         aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"ESP Ligando - Rele Desativado\",\"horario\":\"" + temp + "\"}";
         ini_flag[ind] = 1;
       }
-      aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Desativado\",\"horario\":\"" + temp + "\"}";
+      else
+        aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Desativado\",\"horario\":\"" + temp + "\"}";
       post = SD.open(POST_DIR, FILE_APPEND);
       post.println(aux);
       post.close();
@@ -692,6 +705,7 @@ void r1_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
+        if(marcaOff[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
         lcd_timer = marcaOff[ind];
         lcd.clear();
         lcd.setCursor(0,0);
@@ -712,7 +726,8 @@ void r1_task (void *pvParameters)
         aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"ESP Ligando - Rele Ativado\",\"horario\":\"" + temp + "\"}";
         ini_flag[ind] = 1;
       }
-      aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Ativado\",\"horario\":\"" + temp + "\"}";
+      else
+        aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Ativado\",\"horario\":\"" + temp + "\"}";
       post = SD.open(POST_DIR, FILE_APPEND);
       post.println(aux);
       post.close();
@@ -720,6 +735,7 @@ void r1_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
+        if(marcaOn[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
         lcd_timer = marcaOn[ind];
         lcd.clear();
         lcd.setCursor(0,0);
@@ -758,7 +774,8 @@ void r2_task (void *pvParameters)
         aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"ESP Ligando - Rele Desativado\",\"horario\":\"" + temp + "\"}";
         ini_flag[ind] = 1;
       }
-      aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Desativado\",\"horario\":\"" + temp + "\"}";
+      else
+        aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Desativado\",\"horario\":\"" + temp + "\"}";
       post = SD.open(POST_DIR, FILE_APPEND);
       post.println(aux);
       post.close();
@@ -766,6 +783,7 @@ void r2_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
+        if(marcaOff[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
         lcd_timer = marcaOff[ind];
         lcd.clear();
         lcd.setCursor(0,0);
@@ -786,7 +804,8 @@ void r2_task (void *pvParameters)
         aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"ESP Ligando - Rele Ativado\",\"horario\":\"" + temp + "\"}";
         ini_flag[ind] = 1;
       }
-      aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Ativado\",\"horario\":\"" + temp + "\"}";
+      else
+        aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Ativado\",\"horario\":\"" + temp + "\"}";
       post = SD.open(POST_DIR, FILE_APPEND);
       post.println(aux);
       post.close();
@@ -794,6 +813,7 @@ void r2_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
+        if(marcaOn[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
         lcd_timer = marcaOn[ind];
         lcd.clear();
         lcd.setCursor(0,0);
@@ -832,7 +852,8 @@ void r3_task (void *pvParameters)
         aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"ESP Ligando - Rele Desativado\",\"horario\":\"" + temp + "\"}";
         ini_flag[ind] = 1;
       }
-      aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Desativado\",\"horario\":\"" + temp + "\"}";
+      else
+        aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Desativado\",\"horario\":\"" + temp + "\"}";
       post = SD.open(POST_DIR, FILE_APPEND);
       post.println(aux);
       post.close();
@@ -840,6 +861,7 @@ void r3_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
+        if(marcaOff[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
         lcd_timer = marcaOff[ind];
         lcd.clear();
         lcd.setCursor(0,0);
@@ -860,7 +882,8 @@ void r3_task (void *pvParameters)
         aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"ESP Ligando - Rele Ativado\",\"horario\":\"" + temp + "\"}";
         ini_flag[ind] = 1;
       }
-      aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Ativado\",\"horario\":\"" + temp + "\"}";
+      else
+        aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Ativado\",\"horario\":\"" + temp + "\"}";
       post = SD.open(POST_DIR, FILE_APPEND);
       post.println(aux);
       post.close();
@@ -868,6 +891,7 @@ void r3_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
+        if(marcaOn[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
         lcd_timer = marcaOn[ind];
         lcd.clear();
         lcd.setCursor(0,0);
@@ -906,7 +930,8 @@ void r4_task (void *pvParameters)
         aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"ESP Ligando - Rele Desativado\",\"horario\":\"" + temp + "\"}";
         ini_flag[ind] = 1;
       }
-      aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Desativado\",\"horario\":\"" + temp + "\"}";
+      else
+        aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Desativado\",\"horario\":\"" + temp + "\"}";
       post = SD.open(POST_DIR, FILE_APPEND);
       post.println(aux);
       post.close();
@@ -914,6 +939,7 @@ void r4_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
+        if(marcaOff[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
         lcd_timer = marcaOff[ind];
         lcd.clear();
         lcd.setCursor(0,0);
@@ -934,7 +960,8 @@ void r4_task (void *pvParameters)
         aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"ESP Ligando - Rele Ativado\",\"horario\":\"" + temp + "\"}";
         ini_flag[ind] = 1;
       }
-      aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Ativado\",\"horario\":\"" + temp + "\"}";
+      else
+        aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Ativado\",\"horario\":\"" + temp + "\"}";
       post = SD.open(POST_DIR, FILE_APPEND);
       post.println(aux);
       post.close();
@@ -942,6 +969,7 @@ void r4_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
+        if(marcaOn[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
         lcd_timer = marcaOn[ind];
         lcd.clear();
         lcd.setCursor(0,0);
@@ -980,7 +1008,8 @@ void r5_task (void *pvParameters)
         aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"ESP Ligando - Rele Desativado\",\"horario\":\"" + temp + "\"}";
         ini_flag[ind] = 1;
       }
-      aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Desativado\",\"horario\":\"" + temp + "\"}";
+      else
+        aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Desativado\",\"horario\":\"" + temp + "\"}";
       post = SD.open(POST_DIR, FILE_APPEND);
       post.println(aux);
       post.close();
@@ -988,6 +1017,7 @@ void r5_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
+        if(marcaOff[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
         lcd_timer = marcaOff[ind];
         lcd.clear();
         lcd.setCursor(0,0);
@@ -1008,7 +1038,8 @@ void r5_task (void *pvParameters)
         aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"ESP Ligando - Rele Ativado\",\"horario\":\"" + temp + "\"}";
         ini_flag[ind] = 1;
       }
-      aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Ativado\",\"horario\":\"" + temp + "\"}";
+      else
+        aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Ativado\",\"horario\":\"" + temp + "\"}";
       post = SD.open(POST_DIR, FILE_APPEND);
       post.println(aux);
       post.close();
@@ -1016,6 +1047,7 @@ void r5_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
+        if(marcaOn[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
         lcd_timer = marcaOn[ind];
         lcd.clear();
         lcd.setCursor(0,0);
@@ -1224,6 +1256,40 @@ void sd_error ()
 void notFound(AsyncWebServerRequest *request)
 {
   request->send(404, "text/plain", "Not found");
+}
+
+void scroll_msg (void *pvParameters)
+{
+  str0 = "                " + str0 + "                ";// Adiciona espacos para nao deixar lixo no lcd
+  int i = 16;                                           // Inicializa um indice auxiliar em 16 para comecar o scroll a partir do inicio da mensagem
+  int len0 = str0.length()-16;                            // Inicializa uma variavel para armazenar o tamanho da mensagem com somente um dos 16 espacos em branco                         // 0 = linha de cima, 1 = linha de baixo, 2 = ambas
+  str1 = "                " + str1 + "                ";// Adiciona espacos para nao deixar lixo no lcd
+  int j = 16;                                           // Inicializa um indice auxiliar em 16 para comecar o scroll a partir do inicio da mensagem
+  int len1 = str1.length()-16;                            // Inicializa uma variavel para armazenar o tamanho da mensagem com somente um dos 16 espacos em branco
+  /* Fica em um loop enquanto a variavel global "scroll" estiver ativa
+   * Esta variavel foi declarada como "volatile", portanto o compilador ira checar seu estado em cada loop
+   * Em seu comportamento comum, o compilador checaria o estado da variavel apenas na primeira vez, e esperaria que esta variavel alterasse dentro do loop
+   * Ao declarar como "volatile" voce avisa o compilador que esta variavel pode ser alterada por outras rotinas, portanto o while ira sempre checar o estado dela
+   */
+  while (scroll) {
+    if (ctrl == 0 || ctrl == 2) { // 0 = linha de cima, 1 = linha de baixo, 2 = ambas
+      if (i > len0) i = 0;      // Reinicia o indice auxiliar
+      lcd.setCursor(0, 0);      // Posiciona o cursor na linha selecionada
+      lcd.print(str0.substring(i, i+16));  // printa uma substring de tamanho 16
+      if (i == 16) vTaskDelay(1000/portTICK_PERIOD_MS); // Se o indice estiver em 16, ou seja, no inicio da mensagem, faz um delay um pouco maior
+      else vTaskDelay(250/portTICK_PERIOD_MS);  // Caso contrario faz um delay de 250 ms
+      i++;                      // Incrementa o indice auxiliar
+    }
+    if (ctrl == 1 || ctrl == 2) {
+      if (j > len1) j = 0;      // Reinicia o indice auxiliar
+      lcd.setCursor(0, 1);      // Posiciona o cursor na linha selecionada
+      lcd.print(str1.substring(j, j+16));  // printa uma substring de tamanho 16
+      if (j == 16) vTaskDelay(1000/portTICK_PERIOD_MS); // Se o indice estiver em 16, ou seja, no inicio da mensagem, faz um delay um pouco maior
+      else vTaskDelay(250/portTICK_PERIOD_MS);  // Caso contrario faz um delay de 250 ms
+      j++;                      // Incrementa o indice auxiliar
+    }
+  }
+  vTaskDelete(NULL);        // Mata esta task
 }
 
 void loop() {}
