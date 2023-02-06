@@ -26,6 +26,8 @@
 #define POST_DIR    "/post.txt"     // Diretorio do arquivo de post
 
 #define CONF_PIN    13              // Pino do switch de configuracao
+#define WIFIOFF_PIN 17
+#define SRV_OFF_PIN 16
 
 /* Parametros para o HTTP GET */
 String param_nome_maq   = "nome_maq";
@@ -51,15 +53,12 @@ uint8_t pin[QNT_RELE] = {14, 27, 26, 25, 33, 32};       // Pinos dos Reles
 
 File post;                                              // Variavel para o arquivo de dados
 File conf;                                              // Variavel para o arquivo de configuracao
-time_t seg;                                             // Variavel necessaria para consultar a data/hora
-String str0;
-String str1;
-uint8_t ctrl;
+time_t seg;     
 bool def_msg = 1;                                       // Controle de mensagem padrao para ser exibida no display
 bool server_auth;                                       // Controle de autenticacao de servidor
 bool suspended = 0;                                     // Controle para quando estiver configurando a maquina
 struct tm *timeinfo;                                    // Struct que facilita a selecao das informacoes da data/hora
-volatile bool scroll = 0;
+volatile bool conf_ok = 0;                              // Controle de recebimento de request das configuracoes
 String DEFAULT_AP = "ZZTECH_MONITOR";                   // Nome padrao da maquina
 bool ini_flag[QNT_RELE] = {0, 0, 0, 0, 0, 0};           // Indicador para evitar que o programa indique que o estado inicial do rele seja um evento
 bool used_rele[QNT_RELE] = {1, 1, 1, 1, 1, 1};          // Controle de quais reles serao usados
@@ -273,9 +272,8 @@ const char confok_html[] PROGMEM = R"rawliteral(
                 <h1>ZZTech Monitor</h1>
                 <p id="fst">Configurações salvas.</p>
                 <p id="other">
-                    Você pode fechar esta página e sair do modo de configuração, ou
-                    <a href="/">Retornar para a página anterior</a>
-                    para alterar as configurações.
+                    Configurações salvas. 
+                    Você já pode fechar esta página.
                 </p>
             </div> 
         </body>
@@ -284,7 +282,6 @@ const char confok_html[] PROGMEM = R"rawliteral(
 
 /* Prototipos de funcoes */
 void notFound(AsyncWebServerRequest *request);
-void scroll_msg (void *pvParameters);
 void conf_task (void *pvParameters);
 void time_task (void *pvParameters);
 void wifi_task (void *pvParameters);  TaskHandle_t wifi_handle;
@@ -307,22 +304,6 @@ void setup()
   /* Inicializa o LCD */
   lcd.init();
   lcd.backlight();
-  lcd.clear();
-
-  pinMode(CONF_PIN, INPUT_PULLUP);  // Inicializa o pino de configuracao
-  if(!digitalRead(CONF_PIN)) {      // Caso este pino ja esteja acionado ao ligar a maquina
-    if (serial_debug) {             // Avisa para desligar
-      Serial.printf("\nModo de configuracao ativado.\n");
-      Serial.printf("\nPor favor, desative o modo de configuracao durante a inicializacao.\n");
-    }
-    lcd.setCursor(0, 0);
-    lcd.print("MODO CONF LIGADO");
-    str1 = "DESLIGUE O MODO CONF DURANTE A INICIALIZACAO";
-    ctrl = 1;
-    scroll = 1;
-    xTaskCreate(scroll_msg, "Scroll_LCD", 1024*4, NULL, configMAX_PRIORITIES - 15, NULL);
-    while(!digitalRead(CONF_PIN)) {if (digitalRead(CONF_PIN)) scroll = 0;} // E prende o programa em um loop ate que o switch seja desligado
-  }
 
   /* Inicializa o Cartao SD */
   set_sdcard();
@@ -355,42 +336,34 @@ void setup()
 
 void conf_task (void *pvParameters)
 {
+  pinMode(CONF_PIN, INPUT_PULLUP);
   char aux[17];
   while (1)
   {
     if (!digitalRead(CONF_PIN)) // Caso o botao de configuracao seja acionado
     {
+      suspended = 1;
       vTaskSuspend(wifi_handle);// Suspende as tasks de wifi, http, e  lcd
       vTaskSuspend(http_handle);
       vTaskSuspend(lcd_handle);
       WiFi.disconnect();        // Desconecta o wifi
       WiFi.mode(WIFI_AP);       // Altera o modo de wifi para Access Point
-      suspended = 1;            // Ativa a variavel de suspensao
       if (serial_debug)
         Serial.printf("\nIniciando ponto de acesso de configuracao...\n\n");
       if (nome_maq.isEmpty())   // Verifica se o campo de nome da maquina esta vazio
         nome_maq = DEFAULT_AP;  // Caso esteja, define ele como o nome padrao
       WiFi.softAP(nome_maq.c_str(), AP_PASS); // Inicia o ponto de acesso WiFi
-      ctrl = 1;
-      lcd.setCursor(0, 0);
-      lcd.print("MODO CONF LIGADO");
-      str1 = "ACESSE O WIFI GERADO PELA MAQUINA";
-      scroll = 1;
-      xTaskCreate(scroll_msg, "Scroll_LCD", 1024*4, NULL, configMAX_PRIORITIES - 15, NULL);
-      vTaskDelay(10000/portTICK_PERIOD_MS);
-      scroll = 0;
-      vTaskDelay(1000/portTICK_PERIOD_MS);
       if (serial_debug) {
         Serial.printf("Ponto de acesso WiFi gerado.\nAcesse com as credenciais abaixo para configurar a maquina\n");
         Serial.printf("SSID: %s\nSenha: %s\n\n", nome_maq.c_str(), AP_PASS);
       }
-      sprintf(aux, "%16s", nome_maq.c_str());
-      lcd.setCursor(0, 0);
-      lcd.print(aux);
-      lcd.setCursor(0, 1);
-      sprintf(aux, "%16s", AP_PASS);
-      lcd.print(aux);
       IPAddress IP = WiFi.softAPIP(); // Gera o endereco IP do ESP32
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("MODO CONF LIGADO");
+      sprintf(aux, "%16s", IP.toString().c_str());
+      lcd.setCursor(0, 1);
+      lcd.print(aux);
 
       /* Gera a pagina html de configuracao */
       server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -400,14 +373,6 @@ void conf_task (void *pvParameters)
         Serial.print("Apos conectar ao ponto de acesso, abra seu navegador e acesse o seguinte endereco: ");
         Serial.println(IP); Serial.println();
       }
-      vTaskDelay(30000/portTICK_PERIOD_MS);
-      ctrl = 0;
-      str0 = "ABRA O SEGUINTE ENDERECO NO SEU NAVEGADOR";
-      scroll = 1;
-      xTaskCreate(scroll_msg, "Scroll_LCD", 1024*4, NULL, configMAX_PRIORITIES - 15, NULL);
-      lcd.setCursor(0, 1);
-      sprintf(aux, "%16s", IP.toString().c_str());
-      lcd.print(aux);
 
       /* Recebe os parametros passados pelo usuario e os salva em suas respectivas variaveis */
       server.on("/get", HTTP_GET, [] (AsyncWebServerRequest *request) {
@@ -415,61 +380,63 @@ void conf_task (void *pvParameters)
         wifi_ssid = request->getParam(param_wifi_ssid)->value();
         wifi_pass = request->getParam(param_wifi_pass)->value();
         server_url = request->getParam(param_server_url)->value();
-        if (request->hasParam(param_server_usr) && request->hasParam(param_server_pas))
-          server_auth = 1;
-        if (server_auth)
-        {
-          server_usr = request->getParam(param_server_usr)->value();
-          server_pas = request->getParam(param_server_pas)->value();
-        } else {
-          server_usr = "Servidor sem autenticacao";
-          server_pas = "Servidor sem autenticacao";
-        }
+        server_usr = request->getParam(param_server_usr)->value();
+        server_pas = request->getParam(param_server_pas)->value();
+        if (server_usr.isEmpty() || server_pas.isEmpty())
+          server_auth = 0;
         for (int i = 0; i < QNT_RELE; i++) {
-          if (request->hasParam(param_rele_nick[i])) {
-            rele_nick[i] = request->getParam(param_rele_nick[i])->value();
-            if (rele_nick[i].isEmpty())
-              rele_nick[i] = "UNUSED";
-          }
+          rele_nick[i] = request->getParam(param_rele_nick[i])->value();
+          if (rele_nick[i].isEmpty())
+            rele_nick[i] = "UNUSED";
         }
 
         /* Ao final, exibe uma mensagem ao usuario indicando que as configuracoes foram salvas */
         request->send(200, "text/html", confok_html);
+        conf_ok = 1;  // Se chegou aqui recebeu a get request, entao ativa a variavel de configuracao
       });
       server.onNotFound(notFound);  // Avisa caso o request retorne erro 404
-      server.begin();
+      server.begin();               // Inicia o servidor
 
-      while(!digitalRead(CONF_PIN)) {vTaskDelay(5);}  // Mantem a task presa em um loop pois o codigo acima deve ser executado somente uma vez
-    } else if (digitalRead(CONF_PIN))   // Caso o switch seja desligado
-    {
-      if (suspended)                    // E o programa ja tenha sido suspenso
-      {
-        server.end();                   // Finaliza o servidor
-        WiFi.softAPdisconnect();        // Desativa o Ponto de Acesso
-        WiFi.mode(WIFI_STA);            // Retorna o wifi do ESP para modo de Station
-        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str()); // Inicializa o wifi com as potenciais novas credenciais
-        conf = SD.open(CONF_DIR, FILE_WRITE); // Abre o arquivo de configuracao em modo de escrita
+      while(!conf_ok){}     // Mantem o programa preso em um loop enquanto nao receber uma get request
+      vTaskDelay(1000/portTICK_PERIOD_MS);
 
-        /* Escreve no arquivo as novas configuracoes geradas */
-        conf.print("NOME_MAQ=");    conf.println(nome_maq);
-        conf.print("WIFI_SSID=");   conf.println(wifi_ssid);
-        conf.print("WIFI_PASS=");   conf.println(wifi_pass);
-        conf.print("SERVER_URL=");  conf.println(server_url);
-        conf.print("SERVER_USR=");  conf.println(server_usr);
-        conf.print("SERVER_PAS=");  conf.println(server_pas);
-        conf.print("RELE_NICK=");   conf.print(rele_nick[0]);
-        conf.print(",");            conf.print(rele_nick[1]);
-        conf.print(",");            conf.print(rele_nick[2]);
-        conf.print(",");            conf.print(rele_nick[3]);
-        conf.print(",");            conf.print(rele_nick[4]);
-        conf.print(",");            conf.println(rele_nick[5]);
+      server.end();                   // Finaliza o servidor
+      WiFi.softAPdisconnect();        // Desativa o Ponto de Acesso
+      WiFi.mode(WIFI_STA);            // Retorna o wifi do ESP para modo de Station
+      WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str()); // Inicializa o wifi com as potenciais novas credenciais
+      conf = SD.open(CONF_DIR, FILE_WRITE); // Abre o arquivo de configuracao em modo de escrita
 
-        conf.close();             // Fecha o arquivo
-        ESP.restart();            // Reinicia o ESP
+      /* Escreve no arquivo as novas configuracoes geradas */
+      conf.print("NOME_MAQ=");    conf.println(nome_maq);
+      conf.print("WIFI_SSID=");   conf.println(wifi_ssid);
+      conf.print("WIFI_PASS=");   conf.println(wifi_pass);
+      conf.print("SERVER_URL=");  conf.println(server_url);
+      conf.print("SERVER_USR=");  conf.println(server_usr);
+      conf.print("SERVER_PAS=");  conf.println(server_pas);
+      conf.print("RELE_NICK=");   conf.print(rele_nick[0]);
+      conf.print(",");            conf.print(rele_nick[1]);
+      conf.print(",");            conf.print(rele_nick[2]);
+      conf.print(",");            conf.print(rele_nick[3]);
+      conf.print(",");            conf.print(rele_nick[4]);
+      conf.print(",");            conf.println(rele_nick[5]);
+
+      conf.close();             // Fecha o arquivo
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print(" CONFIG SALVAS  ");
+      if (serial_debug)
+        Serial.println("Configuracoes salvas.");
+      for(int i = 9; i >= 0; i--) {
+        sprintf(aux, "REINICIANDO EM %i", i);
+        lcd.setCursor(0, 1);
+        lcd.print(aux);
+        if(serial_debug)
+          Serial.printf("Reiniciando em %i...\n", i);
+        vTaskDelay(1000/portTICK_PERIOD_MS);
       }
-      while(digitalRead(CONF_PIN)) {vTaskDelay(5);} // Mantem o programa preso em um loop (teoricamente nao deve chegar ate aqui)
+      ESP.restart();  // Reinicia o ESP
     }
-    vTaskDelay(5);                // Pequeno delay para evitar overflow de memoria
+    vTaskDelay(5);    // Pequeno delay para evitar overflow de memoria
   }
 }
 
@@ -484,21 +451,26 @@ void time_task (void *pvParameters)
 
 void wifi_task (void *pvParameters)
 {
-  WiFi.mode(WIFI_STA);  // Confiugra o wifi para  modo de estacao
+  pinMode(WIFIOFF_PIN, OUTPUT);
+  digitalWrite(WIFIOFF_PIN, LOW);
+  WiFi.mode(WIFI_STA);  // Configura o wifi para modo de estacao
   WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str()); // Inicializa o wifi com as configuracoes no cartao sd
   while(1)
   {
     if (WiFi.status() != WL_CONNECTED) {      // Se o wifi nao estiver conectado
+      int i = 0;
+      digitalWrite(WIFIOFF_PIN, HIGH);
       if (serial_debug) {
-        Serial.print("Conectando ao WiFi");
+        Serial.print("Conectando ao WiFi...");
       }
       while (WiFi.status() != WL_CONNECTED) { // Tenta realizar a reconexao
+        if (i >= 30)
+          ESP.restart();
         WiFi.reconnect();
         vTaskDelay(1000/portTICK_PERIOD_MS);
-        if (serial_debug) {
-          Serial.print(".");
-        }
+        i++;
       }
+      digitalWrite(WIFIOFF_PIN, LOW);
       if (serial_debug) {
         Serial.println();
         Serial.println("WiFi Conectado");
@@ -534,10 +506,11 @@ void http_task (void *pvParameters)
       }
       post_ro.close();                        // Fecha o arquivo
       SD.remove(POST_DIR);                    // Deleta o arquivo
-      SD.open(POST_DIR, FILE_WRITE, true);    // Recria o arquivo
+      post_ro = SD.open(POST_DIR, FILE_WRITE, true); // Recria o arquivo
+      post_ro.close();                        // Fecha o o arquivo recriado
       temp.remove(temp.length()-1);           // Remove a ultima virgula
-      /*  Se o arquivo estava vazio, nao vai existir uma virgula, entao esta funcao removera o '[' que foi gerado na inicializacao da string
-       *  resultando em  uma string vazia. */
+      /* Se o arquivo estava vazio, nao vai existir uma virgula, entao esta funcao removera o '[' que foi gerado na inicializacao da string
+      *  resultando em uma string vazia. */
       if(!temp.isEmpty()) // Se a string nao for vazia
       {
         temp.concat("]"); // Fecha o JSON array
@@ -553,14 +526,15 @@ void http_task (void *pvParameters)
         } while (http_response != 200);                       // Continua tentando fazer POST enquanto nao obtiver sucesso
         http_response = -1;
       }
+      vTaskDelay(5);
     }
-    vTaskDelay(5);
   }
 }
 
 void lcd_task (void *pvParameters)
 {
   /* Exibe a mensagem padrao no LCD */
+  lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print(" ZZTECH MONITOR ");
   lcd.setCursor(0, 1);
@@ -576,6 +550,7 @@ void lcd_task (void *pvParameters)
       lcd_flag = 1;   // Ativa a flag quando passar 3 segundos desde que o timer foi acionado
     if (lcd_flag)     // Se a flag estiver ativa, exibe a mensagem padrao
     {
+      lcd.clear();
       lcd.setCursor(0, 0);
       lcd.print(" ZZTECH MONITOR ");
       lcd.setCursor(0, 1);
@@ -1256,40 +1231,6 @@ void sd_error ()
 void notFound(AsyncWebServerRequest *request)
 {
   request->send(404, "text/plain", "Not found");
-}
-
-void scroll_msg (void *pvParameters)
-{
-  str0 = "                " + str0 + "                ";// Adiciona espacos para nao deixar lixo no lcd
-  int i = 16;                                           // Inicializa um indice auxiliar em 16 para comecar o scroll a partir do inicio da mensagem
-  int len0 = str0.length()-16;                            // Inicializa uma variavel para armazenar o tamanho da mensagem com somente um dos 16 espacos em branco                         // 0 = linha de cima, 1 = linha de baixo, 2 = ambas
-  str1 = "                " + str1 + "                ";// Adiciona espacos para nao deixar lixo no lcd
-  int j = 16;                                           // Inicializa um indice auxiliar em 16 para comecar o scroll a partir do inicio da mensagem
-  int len1 = str1.length()-16;                            // Inicializa uma variavel para armazenar o tamanho da mensagem com somente um dos 16 espacos em branco
-  /* Fica em um loop enquanto a variavel global "scroll" estiver ativa
-   * Esta variavel foi declarada como "volatile", portanto o compilador ira checar seu estado em cada loop
-   * Em seu comportamento comum, o compilador checaria o estado da variavel apenas na primeira vez, e esperaria que esta variavel alterasse dentro do loop
-   * Ao declarar como "volatile" voce avisa o compilador que esta variavel pode ser alterada por outras rotinas, portanto o while ira sempre checar o estado dela
-   */
-  while (scroll) {
-    if (ctrl == 0 || ctrl == 2) { // 0 = linha de cima, 1 = linha de baixo, 2 = ambas
-      if (i > len0) i = 0;      // Reinicia o indice auxiliar
-      lcd.setCursor(0, 0);      // Posiciona o cursor na linha selecionada
-      lcd.print(str0.substring(i, i+16));  // printa uma substring de tamanho 16
-      if (i == 16) vTaskDelay(1000/portTICK_PERIOD_MS); // Se o indice estiver em 16, ou seja, no inicio da mensagem, faz um delay um pouco maior
-      else vTaskDelay(250/portTICK_PERIOD_MS);  // Caso contrario faz um delay de 250 ms
-      i++;                      // Incrementa o indice auxiliar
-    }
-    if (ctrl == 1 || ctrl == 2) {
-      if (j > len1) j = 0;      // Reinicia o indice auxiliar
-      lcd.setCursor(0, 1);      // Posiciona o cursor na linha selecionada
-      lcd.print(str1.substring(j, j+16));  // printa uma substring de tamanho 16
-      if (j == 16) vTaskDelay(1000/portTICK_PERIOD_MS); // Se o indice estiver em 16, ou seja, no inicio da mensagem, faz um delay um pouco maior
-      else vTaskDelay(250/portTICK_PERIOD_MS);  // Caso contrario faz um delay de 250 ms
-      j++;                      // Incrementa o indice auxiliar
-    }
-  }
-  vTaskDelete(NULL);        // Mata esta task
 }
 
 void loop() {}
