@@ -19,15 +19,21 @@
 #define HOR_VERAO   3600            // Deslocamento de horario de verao (em segundos)
 
 #define TIMEOUT     3000            // Tempo em milissegundos que o display indicara um novo evento
+#define REL_FREQ    0.5             // Tempo em minutos em que o ESP enviara um POST para informar o estado atual dos reles
 
 #define AP_PASS     "zztech@1020"   // Senha de acesso as configuracoes
 
+#define HTTP_RSRC   "/zziot"        // Diretorio do resource do HTTP
+#define HTTP_TESTE  "/teste"        // Diretorio para teste do servidor
+
 #define CONF_DIR    "/config.ini"   // Diretorio do arquivo de configuracao
 #define POST_DIR    "/post.txt"     // Diretorio do arquivo de post
+#define TEMP_DIR    "/temp.txt"     // Diretorio do arquivo temporario
 
 #define CONF_PIN    13              // Pino do switch de configuracao
-#define WIFIOFF_PIN 17
-#define SRV_OFF_PIN 16
+#define LED_R_PIN   4
+#define LED_G_PIN   17
+#define LED_B_PIN   16
 
 /* Parametros para o HTTP GET */
 String param_nome_maq   = "nome_maq";
@@ -57,9 +63,12 @@ time_t seg;
 bool def_msg = 1;                                       // Controle de mensagem padrao para ser exibida no display
 bool server_auth;                                       // Controle de autenticacao de servidor
 bool suspended = 0;                                     // Controle para quando estiver configurando a maquina
+bool wifi_status = 0;                                   // Controle do status da conexao wifi
+bool http_status = 0;                                   // Controle do status do servidor http
 struct tm *timeinfo;                                    // Struct que facilita a selecao das informacoes da data/hora
 volatile bool conf_ok = 0;                              // Controle de recebimento de request das configuracoes
 String DEFAULT_AP = "ZZTECH_MONITOR";                   // Nome padrao da maquina
+bool est_rele[QNT_RELE] = {0, 0, 0, 0, 0, 0};           // Indicar o estado atual dos reles
 bool ini_flag[QNT_RELE] = {0, 0, 0, 0, 0, 0};           // Indicador para evitar que o programa indique que o estado inicial do rele seja um evento
 bool used_rele[QNT_RELE] = {1, 1, 1, 1, 1, 1};          // Controle de quais reles serao usados
 unsigned long lcd_timer = 0;                            // Variavel auxiliar para controlar o tempo que um evento e mostrado na tela
@@ -133,7 +142,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <div class="container">
                     <h1>ZZTech Monitor</h1>
                     <p>Configurações da máquina.</p>
-                    <label for="nome_maq"><b>Nome da máquina</b></label>
+                    <label for="nome_maq"><b>Nome da máquina (Também será o SSID do Ponto de Acesso WiFi de configuração)</b></label>
                     <input
                         type="text"
                         placeholder="Digite o nome da máquina (máximo 16 caracteres)."
@@ -287,29 +296,42 @@ void time_task (void *pvParameters);
 void wifi_task (void *pvParameters);  TaskHandle_t wifi_handle;
 void http_task (void *pvParameters);  TaskHandle_t http_handle;
 void lcd_task (void *pvParameters);   TaskHandle_t lcd_handle;
+void led_task (void *pvParameters);
+void rel_task (void *pvParameters);   TaskHandle_t rel_handle;
 void r0_task (void *pvParameters);
 void r1_task (void *pvParameters);
 void r2_task (void *pvParameters);
 void r3_task (void *pvParameters);
 void r4_task (void *pvParameters);
 void r5_task (void *pvParameters);
+void rgb(bool R, bool G, bool B);
 void set_sdcard ();
 void sd_error ();
 void get_conf();
 
 void setup()
 {
-  Serial.begin(115200);             // Inicializa o Serial
+  if (serial_debug)
+    Serial.begin(115200);             // Inicializa o Serial
 
   /* Inicializa o LCD */
   lcd.init();
   lcd.backlight();
+
+  /* Inicializa o LED RGB */
+  pinMode(LED_R_PIN, OUTPUT);
+  pinMode(LED_G_PIN, OUTPUT);
+  pinMode(LED_B_PIN, OUTPUT);
+  digitalWrite(LED_R_PIN, LOW);
+  digitalWrite(LED_G_PIN, LOW);
+  digitalWrite(LED_B_PIN, LOW);
 
   /* Inicializa o Cartao SD */
   set_sdcard();
   get_conf();
 
   /* Inicializa as tasks */
+  xTaskCreate(led_task,   "LED_Task",   1024*2, NULL, configMAX_PRIORITIES -  15, NULL);
   xTaskCreate(wifi_task,                // Funcao da task
               "WiFi_Task",              // Nome da task
               1024*4,                   // Tamanho da pilha de execucao da task (geralmente 4 kbytes sao o suficiente)
@@ -318,7 +340,7 @@ void setup()
               &wifi_handle);            // Handler da Task (para que outras tasks ou funcoes da freeRTOS possam se comunicar com esta task)
   xTaskCreate(http_task,  "HTTP_Task",  1024*4, NULL, configMAX_PRIORITIES -  9, &http_handle);
   xTaskCreate(lcd_task,   "LCD_Task",   1024*4, NULL, configMAX_PRIORITIES -  9, &lcd_handle);
-  xTaskCreate(time_task,  "Time_Task",  1024*4, NULL, configMAX_PRIORITIES -  9, NULL);
+  xTaskCreate(time_task,  "Time_Task",  1024*2, NULL, configMAX_PRIORITIES -  9, NULL);
   if(used_rele[0])  // Inicializa apenas as tasks com reles ativos
     xTaskCreate(r0_task,  "Rele0_Task", 1024*4, NULL, configMAX_PRIORITIES - 10, NULL);
   if(used_rele[1])
@@ -331,6 +353,7 @@ void setup()
     xTaskCreate(r4_task,  "Rele4_Task", 1024*4, NULL, configMAX_PRIORITIES - 10, NULL);
   if(used_rele[5])
     xTaskCreate(r5_task,  "Rele5_Task", 1024*4, NULL, configMAX_PRIORITIES - 10, NULL);
+  xTaskCreate(rel_task,   "Rel_Task",   1024*4, NULL, configMAX_PRIORITIES - 10, &rel_handle);
   xTaskCreate(conf_task,  "AP_Task",    1024*4, NULL, configMAX_PRIORITIES -  7, NULL);
 }
 
@@ -343,7 +366,8 @@ void conf_task (void *pvParameters)
     if (!digitalRead(CONF_PIN)) // Caso o botao de configuracao seja acionado
     {
       suspended = 1;
-      vTaskSuspend(wifi_handle);// Suspende as tasks de wifi, http, e  lcd
+      vTaskSuspend(rel_handle);
+      vTaskSuspend(wifi_handle);// Suspende as tasks de relatorio, wifi, http e lcd
       vTaskSuspend(http_handle);
       vTaskSuspend(lcd_handle);
       WiFi.disconnect();        // Desconecta o wifi
@@ -451,27 +475,26 @@ void time_task (void *pvParameters)
 
 void wifi_task (void *pvParameters)
 {
-  pinMode(WIFIOFF_PIN, OUTPUT);
-  digitalWrite(WIFIOFF_PIN, LOW);
   WiFi.mode(WIFI_STA);  // Configura o wifi para modo de estacao
   WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str()); // Inicializa o wifi com as configuracoes no cartao sd
   while(1)
   {
     if (WiFi.status() != WL_CONNECTED) {      // Se o wifi nao estiver conectado
       int i = 0;
-      digitalWrite(WIFIOFF_PIN, HIGH);
-      if (serial_debug) {
+      if (serial_debug)
         Serial.print("Conectando ao WiFi...");
-      }
       while (WiFi.status() != WL_CONNECTED) { // Tenta realizar a reconexao
         if (i >= 30)
           ESP.restart();
-        WiFi.reconnect();
-        vTaskDelay(1000/portTICK_PERIOD_MS);
+        /* Na lib WiFi existe a funcao de reconexao, porem desconectar e reiniciar e mais seguro */
+        WiFi.disconnect();
+        vTaskDelay(150/portTICK_PERIOD_MS);
+        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+        vTaskDelay(850/portTICK_PERIOD_MS);
         i++;
       }
-      digitalWrite(WIFIOFF_PIN, LOW);
       if (serial_debug) {
+        wifi_status = 1;
         Serial.println();
         Serial.println("WiFi Conectado");
       }
@@ -482,52 +505,107 @@ void wifi_task (void *pvParameters)
 
 void http_task (void *pvParameters)
 {
-  WiFiClient client;  // Cria o cliente WiFi
-  HTTPClient http;    // Cria o objeto para chamar as funcoes http
+  WiFiClient client;        // Cria o cliente WiFi
+  HTTPClient http_resource; // Cria o objeto para chamar as funcoes http
+  HTTPClient http_teste;    // Cria o objeto para testar a disponibilidade do servidor
+  int http_response = -1;   // Para armazenar o codigo de resposta
 
-  http.begin(client, server_url.c_str()); // Inicializa a conexao com o servidor http
-  if (server_auth)                        // Realiza a autenticacao caso o servidor exija
-    http.setAuthorization(server_usr.c_str(), server_pas.c_str());
-  int http_response = -1; // Para armazenar o codigo de resposta
+  while (!http_resource.begin(client, server_url + HTTP_RSRC)) { // Inicializa a conexao com o servidor http
+    vTaskDelay(1000/portTICK_PERIOD_MS);
+  }
+  if (serial_debug)
+    Serial.println("Servidor HTTP resource inicializado.");
+  while (!http_teste.begin(client, server_url + HTTP_RSRC + HTTP_TESTE)) {
+    vTaskDelay(1000/portTICK_PERIOD_MS);
+  }
+  if (serial_debug)
+    Serial.println("Servidor HTTP teste inicializado.");
+  if (server_auth) { // Realiza a autenticacao caso o servidor exija
+    http_resource.setAuthorization(server_usr.c_str(), server_pas.c_str());
+    http_teste.setAuthorization(server_usr.c_str(), server_pas.c_str());
+  }
+  do {
+    http_response = http_teste.GET();
+    if (serial_debug)
+      Serial.printf("\nHTTP GET response code: %i\n", http_response);
+    if (http_response != 200) {
+      vTaskDelay(1000/portTICK_PERIOD_MS);
+    }
+  } while(http_response != 200);
+  http_status = 1;
+  if (serial_debug)
+    Serial.printf("Servidor HTTP GET OK.\n\n");
   while (1)
   {
-    if (WiFi.status() == WL_CONNECTED)
+    bool wroteFile = 0;
+    String temp = "[";                  // Inicializa o JSON array para post
+    String aux;                         // Variavel auxiliar para montar o post
+    File ftemp;                         // Variavel do arquivo de backup
+    /* Verifica se o arquivo de backup ja existe. Se existir, entao o ESP foi reiniciado antes de completar o ultimo POST.
+      * Se esse for o caso, ignora o arquivo de post por hora, e realiza o POST dos dados salvos no backup. */
+    if (SD.exists(TEMP_DIR))
     {
-      String temp = "[";                      // Inicializa o JSON array para post
-      String aux;                             // Variavel auxiliar para montar o post
+      ftemp = SD.open(TEMP_DIR);          // Abre o arquivo temporario
+      if (ftemp.readStringUntil('\n').isEmpty()) {
+        ftemp.close();
+        SD.remove(TEMP_DIR);
+      } else {
+        while(1)                            // Se mantem em um loop ate sair por um break em uma condicao abaixo
+        {
+          aux = ftemp.readStringUntil('\n');  // Le ate a quebra de linha
+          if(aux.isEmpty())                   // Se a leitura for vazia, chegou ao final do arquivo
+            break;                              // Sai do loop
+          aux.remove(aux.length()-1);         // Se ainda nao tiver saido do loop, remove o caractere lixo que gera ao final de quebra de linhas
+          temp += aux + ",";                  // Complementa a string para post
+        }
+        ftemp.close();                      // E fecha o arquivo temporario
+      }
+    } else {
+      ftemp = SD.open(TEMP_DIR, FILE_WRITE, true);  // Cria o arquivo de backup
       File post_ro = SD.open(POST_DIR, FILE_READ);  // Abre o arquivo de post como somente leitura
       while(1)
       {
         aux = post_ro.readStringUntil('\n');  // Le ate a quebra de linha
         if(aux.isEmpty())                     // Se a leitura for vazia, chegou ao final do arquivo
-          break;                              // Sai do loop
+          break;                                // Sai do loop
         aux.remove(aux.length()-1);           // Se ainda nao tiver saido do loop, remove o caractere lixo que gera ao final de quebra de linhas
+        ftemp.println(aux.c_str());           // Salva os dados em um arquivo temporario
         temp += aux + ",";                    // Complementa a string para post
       }
-      post_ro.close();                        // Fecha o arquivo
-      SD.remove(POST_DIR);                    // Deleta o arquivo
-      post_ro = SD.open(POST_DIR, FILE_WRITE, true); // Recria o arquivo
-      post_ro.close();                        // Fecha o o arquivo recriado
-      temp.remove(temp.length()-1);           // Remove a ultima virgula
-      /* Se o arquivo estava vazio, nao vai existir uma virgula, entao esta funcao removera o '[' que foi gerado na inicializacao da string
-      *  resultando em uma string vazia. */
-      if(!temp.isEmpty()) // Se a string nao for vazia
-      {
-        temp.concat("]"); // Fecha o JSON array
-        do
-        {
-          http_response = http.POST(temp);                    // Tenta fazer o POST
-          if (serial_debug) {
-            Serial.println(temp);                             // Exibe o JSON no Serial
-            Serial.print("HTTP Response Code: ");             // Exibe o codigo de resposta no Serial
-            Serial.println(http_response);
-          }
-          vTaskDelay(5000/portTICK_PERIOD_MS);                // Espera 5 segundos antes de tentar realizar outro POST
-        } while (http_response != 200);                       // Continua tentando fazer POST enquanto nao obtiver sucesso
-        http_response = -1;
-      }
-      vTaskDelay(5);
+      post_ro.close();                      // Fecha...
+      SD.remove(POST_DIR);                  // Deleta...
+      post_ro = SD.open(POST_DIR, FILE_WRITE, true); // E recria o arquivo principal
+      post_ro.close();                      // Fecha o arquivo recriado
+      ftemp.close();                        // Fecha o arquivo de backup
+      wroteFile = 1;
     }
+    temp.remove(temp.length()-1);         // Remove a ultima virgula
+    /* Se o arquivo estava vazio, nao vai existir uma virgula, entao esta funcao removera o '[' que foi gerado na inicializacao da string
+    *  resultando em uma string vazia. */
+    if(!temp.isEmpty()) // Se a string nao for vazia
+    {
+      temp.concat("]");                       // Fecha o JSON array
+      int i = 0;
+      do
+      {
+        i++;
+        http_response = http_resource.POST(temp);        // Tenta fazer o POST
+        if (serial_debug) {
+          Serial.println();
+          Serial.println(temp);                   // Exibe o JSON no Serial
+          Serial.printf("\nTentando fazer o post em : %s\n", String(server_url + HTTP_RSRC).c_str());
+          Serial.print("HTTP Response Code: ");   // Exibe o codigo de resposta no Serial
+          Serial.println(http_response);
+        }
+        if (i == 3)
+          http_status = 0;
+        vTaskDelay(5000/portTICK_PERIOD_MS);    // Espera 5 segundos antes de tentar realizar outro POST
+      } while (http_response != 200);           // Continua tentando fazer POST enquanto nao obtiver sucesso
+      http_status = 1;
+      SD.remove(TEMP_DIR);  // Se chegou ate aqui, o POST foi feito com sucesso, entao exclui o arquivo de backup
+      http_response = -1;
+    }
+    vTaskDelay(5);
   }
 }
 
@@ -567,6 +645,33 @@ void lcd_task (void *pvParameters)
   }
 }
 
+void led_task (void *pvParameters)
+{
+  while (1)
+  {
+    while(suspended)
+    {
+      rgb(0,0,1);
+      vTaskDelay(1000/portTICK_PERIOD_MS);
+      rgb(0,0,0);
+      vTaskDelay(1000/portTICK_PERIOD_MS);
+    }
+    if(!wifi_status) {
+      rgb(1,0,0);
+      while(!wifi_status){vTaskDelay(5);}
+    }
+    else if (!http_status) {
+      rgb(1,1,0);
+      while(!http_status){vTaskDelay(5);}
+    }
+    else {
+      rgb(0,1,0);
+      while(http_status && http_status){vTaskDelay(5);}
+    }
+    vTaskDelay(5);
+  }
+}
+
 void r0_task (void *pvParameters)
 {
   int ind = 0;              // Indica o indice do rele
@@ -584,6 +689,7 @@ void r0_task (void *pvParameters)
   {
     if (!gpio_get_level((gpio_num_t)pin[ind]))  // Caso a leitura do pino seja LOW
     {
+      est_rele[ind] = 0;
       marcaOff[ind] = millis();     // Armazena o momento em que o rele foi desativado
       time(&seg);                   // Armazena a data e hora atuais em segundos
       timeinfo = localtime(&seg);   // Converte a data e hora para uma struct que premite a leitura mais dinamica das informacoes de data e hora// Armazena as informacoes de data e hora na string auxiliar
@@ -614,6 +720,7 @@ void r0_task (void *pvParameters)
     }
     else if (gpio_get_level((gpio_num_t)pin[ind]))  // Realiza o mesmo procedimento para quando a leitura do pino for HIGH
     {
+      est_rele[ind] = 1;
       marcaOn[ind] = millis();
       time(&seg);
       timeinfo = localtime(&seg);
@@ -662,6 +769,7 @@ void r1_task (void *pvParameters)
   {
     if (!gpio_get_level((gpio_num_t)pin[ind]))
     {
+      est_rele[ind] = 0;
       marcaOff[ind] = millis();
       time(&seg);
       timeinfo = localtime(&seg);
@@ -692,6 +800,7 @@ void r1_task (void *pvParameters)
     }
     else if (gpio_get_level((gpio_num_t)pin[ind]))
     {
+      est_rele[ind] = 1;
       marcaOn[ind] = millis();
       time(&seg);
       timeinfo = localtime(&seg);
@@ -740,6 +849,7 @@ void r2_task (void *pvParameters)
   {
     if (!gpio_get_level((gpio_num_t)pin[ind]))
     {
+      est_rele[ind] = 0;
       marcaOff[ind] = millis();
       time(&seg);
       timeinfo = localtime(&seg);
@@ -770,6 +880,7 @@ void r2_task (void *pvParameters)
     }
     else if (gpio_get_level((gpio_num_t)pin[ind]))
     {
+      est_rele[ind] = 1;
       marcaOn[ind] = millis();
       time(&seg);
       timeinfo = localtime(&seg);
@@ -818,6 +929,7 @@ void r3_task (void *pvParameters)
   {
     if (!gpio_get_level((gpio_num_t)pin[ind]))
     {
+      est_rele[ind] = 0;
       marcaOff[ind] = millis();
       time(&seg);
       timeinfo = localtime(&seg);
@@ -848,6 +960,7 @@ void r3_task (void *pvParameters)
     }
     else if (gpio_get_level((gpio_num_t)pin[ind]))
     {
+      est_rele[ind] = 1;
       marcaOn[ind] = millis();
       time(&seg);
       timeinfo = localtime(&seg);
@@ -896,6 +1009,7 @@ void r4_task (void *pvParameters)
   {
     if (!gpio_get_level((gpio_num_t)pin[ind]))
     {
+      est_rele[ind] = 0;
       marcaOff[ind] = millis();
       time(&seg);
       timeinfo = localtime(&seg);
@@ -926,6 +1040,7 @@ void r4_task (void *pvParameters)
     }
     else if (gpio_get_level((gpio_num_t)pin[ind]))
     {
+      est_rele[ind] = 1;
       marcaOn[ind] = millis();
       time(&seg);
       timeinfo = localtime(&seg);
@@ -974,6 +1089,7 @@ void r5_task (void *pvParameters)
   {
     if (!gpio_get_level((gpio_num_t)pin[ind]))
     {
+      est_rele[ind] = 0;
       marcaOff[ind] = millis();
       time(&seg);
       timeinfo = localtime(&seg);
@@ -1004,6 +1120,7 @@ void r5_task (void *pvParameters)
     }
     else if (gpio_get_level((gpio_num_t)pin[ind]))
     {
+      est_rele[ind] = 1;
       marcaOn[ind] = millis();
       time(&seg);
       timeinfo = localtime(&seg);
@@ -1137,9 +1254,11 @@ void get_conf ()
   temp.remove(strlen(temp.c_str())-1, 1);
   if (temp.isEmpty())
     missing_conf = 1;
-  else 
+  else if (temp.substring(0, 7) == "http://")
   {
     server_url = temp;
+  } else {
+    server_url = "http://" + temp;
   }
 
   /* Le o usuario do server */
@@ -1215,6 +1334,7 @@ void get_conf ()
 
 void sd_error ()
 {
+  rgb(1,0,0);
   char temp[17];
   for (int i = 9; i >= 0; i--)
   {
@@ -1226,6 +1346,41 @@ void sd_error ()
     delay(1000);
   }
   ESP.restart();
+}
+
+void rel_task (void *pvParameters)
+{
+  char temp[20];
+  while(1)
+  {
+    vTaskDelay((int)(REL_FREQ * 60000)/portTICK_PERIOD_MS);
+    for (int i = 0; i < QNT_RELE; i++)
+    {
+      if (used_rele[i])
+      {
+        time(&seg);
+        timeinfo = localtime(&seg);
+        sprintf(temp, "%02d/%02d/%04d-%02d:%02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+        String aux;
+        if (est_rele[i])
+          aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[i] + "\",\"evento\":\"Relatorio - Ativado\",\"horario\":\"" + temp + "\"}";
+        else
+          aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[i] + "\",\"evento\":\"Relatorio - Desativado\",\"horario\":\"" + temp + "\"}";
+        post = SD.open(POST_DIR, FILE_APPEND);
+        post.println(aux);
+        post.close();
+        if(serial_debug)
+          Serial.println(aux);
+      }
+    }
+  }
+}
+
+void rgb (bool R, bool G, bool B)
+{
+  digitalWrite(LED_R_PIN, R);
+  digitalWrite(LED_G_PIN, G);
+  digitalWrite(LED_B_PIN, B);
 }
 
 void notFound(AsyncWebServerRequest *request)
