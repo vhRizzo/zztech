@@ -62,7 +62,7 @@ uint8_t pin[QNT_RELE] = {33, 32, 35, 34, 39, 36};       // Pinos dos Reles
 
 File post;                                              // Variavel para o arquivo de dados
 File conf;                                              // Variavel para o arquivo de configuracao
-time_t seg;     
+time_t seg;                                             // Controle do relogio
 bool def_msg = 1;                                       // Controle de mensagem padrao para ser exibida no display
 bool server_auth;                                       // Controle de autenticacao de servidor
 bool suspended = 0;                                     // Controle para quando estiver configurando a maquina
@@ -317,7 +317,6 @@ void setup()
   if (serial_debug)
     Serial.begin(115200);             // Inicializa o Serial
 
-
   /* Inicializa o LCD */
   lcd.begin(16, 2, LCD_5x8DOTS, I2C_SDA_PIN, I2C_SCL_PIN);
   lcd.backlight();
@@ -341,14 +340,16 @@ void setup()
               NULL,                     // Parametros da Task
               configMAX_PRIORITIES - 8, // Prioridade da Task (quanto maior o valor, maior a prioridade)
               &wifi_handle);            // Handler da Task (para que outras tasks ou funcoes da freeRTOS possam se comunicar com esta task)
+  
   /* Faz a primeira sincronizacao do relogio e nao inicia o monitoramento enquanto nao estiver sincronizado */
-  configTime(GMT_OFFSET, HOR_VERAO, NTP_SERVER);
   do {
+    configTime(GMT_OFFSET, HOR_VERAO, NTP_SERVER);
     time(&seg);
     timeinfo = localtime(&seg);
     if (timeinfo->tm_year+1900 < 2020)
       vTaskDelay(250/portTICK_PERIOD_MS);
   } while (timeinfo->tm_year+1900 < 2020);
+  
   xTaskCreate(http_task,  "HTTP_Task",  1024*4, NULL, configMAX_PRIORITIES -  9, &http_handle);
   xTaskCreate(led_task,   "LED_Task",   1024*2, NULL, configMAX_PRIORITIES -  15, NULL);
   xTaskCreate(lcd_task,   "LCD_Task",   1024*4, NULL, configMAX_PRIORITIES -  9, &lcd_handle);
@@ -371,15 +372,15 @@ void setup()
 
 void conf_task (void *pvParameters)
 {
-  pinMode(CONF_PIN, INPUT_PULLUP);
-  char aux[17];
+  pinMode(CONF_PIN, INPUT_PULLUP);  // Inicializa o pino do botao de configuracao em modo de pullup
+  char aux[17];                     // String auxiliar para print no display
   while (1)
   {
     if (!digitalRead(CONF_PIN)) // Caso o botao de configuracao seja acionado
     {
-      suspended = 1;
-      vTaskSuspend(rel_handle);
-      vTaskSuspend(wifi_handle);// Suspende as tasks de relatorio, wifi, http e lcd
+      suspended = 1;            // Avisa as tasks pertinentes de que o sistema esta suspenso
+      vTaskSuspend(rel_handle); // Suspende as tasks de relatorio, wifi, http e lcd
+      vTaskSuspend(wifi_handle);
       vTaskSuspend(http_handle);
       vTaskSuspend(lcd_handle);
       WiFi.disconnect();        // Desconecta o wifi
@@ -396,7 +397,7 @@ void conf_task (void *pvParameters)
       IPAddress IP = WiFi.softAPIP(); // Gera o endereco IP do ESP32
       lcd.setCursor(0, 0);
       lcd.print("MODO CONF LIGADO");
-      sprintf(aux, "%16s", IP.toString().c_str());
+      sprintf(aux, "%16s", IP.toString().c_str());  // E exibe no display
       lcd.setCursor(0, 1);
       lcd.print(aux);
 
@@ -404,6 +405,7 @@ void conf_task (void *pvParameters)
       server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
         request->send_P(200, "text/html", index_html);
       });
+
       if (serial_debug) {
         Serial.print("Apos conectar ao ponto de acesso, abra seu navegador e acesse o seguinte endereco: ");
         Serial.println(IP); Serial.println();
@@ -432,13 +434,11 @@ void conf_task (void *pvParameters)
       server.onNotFound(notFound);  // Avisa caso o request retorne erro 404
       server.begin();               // Inicia o servidor
 
-      while(!conf_ok){}     // Mantem o programa preso em um loop enquanto nao receber uma get request
+      while(!conf_ok){vTaskDelay(5);} // Mantem o programa preso em um loop enquanto nao receber uma get request
       vTaskDelay(1000/portTICK_PERIOD_MS);
 
       server.end();                   // Finaliza o servidor
       WiFi.softAPdisconnect();        // Desativa o Ponto de Acesso
-      WiFi.mode(WIFI_STA);            // Retorna o wifi do ESP para modo de Station
-      WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str()); // Inicializa o wifi com as potenciais novas credenciais
       conf = SD.open(CONF_DIR, FILE_WRITE); // Abre o arquivo de configuracao em modo de escrita
 
       /* Escreve no arquivo as novas configuracoes geradas */
@@ -535,19 +535,18 @@ void http_task (void *pvParameters)
     http_teste.setAuthorization(server_usr.c_str(), server_pas.c_str());
   }
   do {
-    http_response = http_teste.GET();
+    http_response = http_teste.GET(); // Envia uma GET request ao servidor e continua tentando ate que o servidor responda OK
     if (serial_debug)
       Serial.printf("\nHTTP GET response code: %i\n", http_response);
     if (http_response != 200) {
       vTaskDelay(1000/portTICK_PERIOD_MS);
     }
   } while(http_response != 200);
-  http_status = 1;
+  http_status = 1;  // Sair do loop acima indica que o servidor esta OK, entao ativa a variavel de controle sobre o status do servidor
   if (serial_debug)
     Serial.printf("Servidor HTTP GET OK.\n\n");
   while (1)
   {
-    bool wroteFile = 0;
     String temp = "[";                  // Inicializa o JSON array para post
     String aux;                         // Variavel auxiliar para montar o post
     File ftemp;                         // Variavel do arquivo de backup
@@ -555,12 +554,13 @@ void http_task (void *pvParameters)
       * Se esse for o caso, ignora o arquivo de post por hora, e realiza o POST dos dados salvos no backup. */
     if (SD.exists(TEMP_DIR))
     {
-      ftemp = SD.open(TEMP_DIR);          // Abre o arquivo temporario
+      /* Primeiro verifica se o aquivo esta vazio, se estiver, deleta ele */
+      ftemp = SD.open(TEMP_DIR);
       if (ftemp.readStringUntil('\n').isEmpty()) {
         ftemp.close();
         SD.remove(TEMP_DIR);
-      } else {
-        ftemp.rewindDirectory();
+      } else {                            // Caso contrario
+        ftemp.rewindDirectory();          // Retorna o arquivo para o inicio
         while(1)                            // Se mantem em um loop ate sair por um break em uma condicao abaixo
         {
           aux = ftemp.readStringUntil('\n');  // Le ate a quebra de linha
@@ -588,7 +588,6 @@ void http_task (void *pvParameters)
       post_ro = SD.open(POST_DIR, FILE_WRITE, true); // E recria o arquivo principal
       post_ro.close();                      // Fecha o arquivo recriado
       ftemp.close();                        // Fecha o arquivo de backup
-      wroteFile = 1;
     }
     temp.remove(temp.length()-1);         // Remove a ultima virgula
     /* Se o arquivo estava vazio, nao vai existir uma virgula, entao esta funcao removera o '[' que foi gerado na inicializacao da string
@@ -649,22 +648,22 @@ void led_task (void *pvParameters)
 {
   while (1)
   {
-    while(suspended)
+    while(suspended)          // Se o programa estiver suspenso, pisca o LED em azul
     {
       rgb(0,0,1);
       vTaskDelay(1000/portTICK_PERIOD_MS);
       rgb(0,0,0);
       vTaskDelay(1000/portTICK_PERIOD_MS);
     }
-    if(!wifi_status) {
+    if(!wifi_status) {        // Se o WiFi estiver desconectado, o LED fica vermelho
       rgb(1,0,0);
       while(!wifi_status){vTaskDelay(5);}
     }
-    else if (!http_status) {
+    else if (!http_status) {  // Caso contrario, se o servidor HTTP estiver desconectado, o LED fica amarelo
       rgb(1,1,0);
       while(!http_status){vTaskDelay(5);}
     }
-    else {
+    else {                    // Se nao tiver nenhum outro erro, o LED fica verde
       rgb(0,1,0);
       while(http_status && http_status){vTaskDelay(5);}
     }
@@ -689,19 +688,19 @@ void r0_task (void *pvParameters)
   {
     if (!gpio_get_level((gpio_num_t)pin[ind]))  // Caso a leitura do pino seja LOW
     {
-      est_rele[ind] = 0;
+      est_rele[ind] = 0;            // Armazena o estado do rele para a task de relatorio periodico
       marcaOff[ind] = millis();     // Armazena o momento em que o rele foi desativado
       time(&seg);                   // Armazena a data e hora atuais em segundos
       timeinfo = localtime(&seg);   // Con
       sprintf(temp, "%02d/%02d/%04d-%02d:%02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
       String aux;                   // String para escrever no arquivo
-      if (!ini_flag[ind]) {
+      if (!ini_flag[ind]) {         // Se for o primeiro evento desde a inicializacao do ESP, envia um evento personalizado informando o estado do rele na inicializacao
         aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"ESP Ligando - Rele Desativado\",\"horario\":\"" + temp + "\"}";
-        ini_flag[ind] = 1;
+        ini_flag[ind] = 1;          // E ativa a variavel para indicar que as demais leituras nao sao mais a primeira
       }
-      else
+      else                          // Caso nao seja mais a primeira, somente avisa o evento do rele
         aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[ind] + "\",\"evento\":\"Desativado\",\"horario\":\"" + temp + "\"}";
-      post = SD.open(POST_DIR, FILE_APPEND);  // Abreo arquivo em modo de "append" (escrita apenas no final)
+      post = SD.open(POST_DIR, FILE_APPEND);  // Abre o arquivo em modo de "append" (escrita apenas no final)
       post.println(aux);            // Escreve os dados no arquivo
       post.close();                 // Fecha o arquivo
       if(serial_debug)
@@ -1338,6 +1337,8 @@ void sd_error ()
 
 void rel_task (void *pvParameters)
 {
+  /* Essa task tem o mesmo comportamento das tasks dos reles, mas em vez de permanecer "escutando" por eventos do rele,
+   * apenas envia o estado atual do rele */
   char temp[20];
   while(1)
   {
@@ -1350,7 +1351,7 @@ void rel_task (void *pvParameters)
         timeinfo = localtime(&seg);
         sprintf(temp, "%02d/%02d/%04d-%02d:%02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
         String aux;
-        if (est_rele[i])
+        if (est_rele[i])  // Para evitar de ficar lendo o estado do rele toda hora, apenas utiliza uma variavel global para salvar o estado do rele
           aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[i] + "\",\"evento\":\"Relatorio - Ativado\",\"horario\":\"" + temp + "\"}";
         else
           aux = "{\"maquina\":\"" + nome_maq + "\",\"dispositivo\":\"" + rele_nick[i] + "\",\"evento\":\"Relatorio - Desativado\",\"horario\":\"" + temp + "\"}";
