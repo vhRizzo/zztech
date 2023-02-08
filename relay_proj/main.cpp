@@ -6,6 +6,7 @@
 #include <Arduino.h>
 #include <time.h>
 #include <WiFi.h>
+#include <Wire.h>
 #include <SPI.h>
 #include <FS.h>
 #include <SD.h>
@@ -31,9 +32,11 @@
 #define TEMP_DIR    "/temp.txt"     // Diretorio do arquivo temporario
 
 #define CONF_PIN    13              // Pino do switch de configuracao
-#define LED_R_PIN   4
-#define LED_G_PIN   17
-#define LED_B_PIN   16
+#define LED_R_PIN   4               // Pino do LED vermelho do LED RGB
+#define LED_G_PIN   17              // Pino do LED verde do LED RGB
+#define LED_B_PIN   16              // Pino do LED azul do LED RGB
+#define I2C_SDA_PIN 26              // Pino SDA do LCD I2C
+#define I2C_SCL_PIN 25              // Pino SCL do LCD I2C
 
 /* Parametros para o HTTP GET */
 String param_nome_maq   = "nome_maq";
@@ -55,7 +58,7 @@ String rele_nick[QNT_RELE];
 
 bool serial_debug = 1;                                  // Para debug do dispositivo
 
-uint8_t pin[QNT_RELE] = {14, 27, 26, 25, 33, 32};       // Pinos dos Reles
+uint8_t pin[QNT_RELE] = {33, 32, 35, 34, 39, 36};       // Pinos dos Reles
 
 File post;                                              // Variavel para o arquivo de dados
 File conf;                                              // Variavel para o arquivo de configuracao
@@ -75,7 +78,7 @@ unsigned long lcd_timer = 0;                            // Variavel auxiliar par
 unsigned long marcaOff[QNT_RELE] = {0, 0, 0, 0, 0, 0};  // Variavel para armazenar o instante em que um rele e desligado
 unsigned long marcaOn[QNT_RELE] = {0, 0, 0, 0, 0, 0};   // Variavel para armazenar o instanto em que um rele e ligado
 
-LiquidCrystal_I2C lcd(0x27, 16, 2); // Inicializa o display
+LiquidCrystal_I2C lcd(PCF8574_ADDR_A21_A11_A01, 4, 5, 6, 16, 11, 12, 13, 14, POSITIVE); // Inicializa o display
 AsyncWebServer server(80);          // Inicializa o server interno
 
 /* Pagina html de configuracao */
@@ -314,8 +317,9 @@ void setup()
   if (serial_debug)
     Serial.begin(115200);             // Inicializa o Serial
 
+
   /* Inicializa o LCD */
-  lcd.init();
+  lcd.begin(16, 2, LCD_5x8DOTS, I2C_SDA_PIN, I2C_SCL_PIN);
   lcd.backlight();
 
   /* Inicializa o LED RGB */
@@ -331,14 +335,22 @@ void setup()
   get_conf();
 
   /* Inicializa as tasks */
-  xTaskCreate(led_task,   "LED_Task",   1024*2, NULL, configMAX_PRIORITIES -  15, NULL);
   xTaskCreate(wifi_task,                // Funcao da task
               "WiFi_Task",              // Nome da task
               1024*4,                   // Tamanho da pilha de execucao da task (geralmente 4 kbytes sao o suficiente)
               NULL,                     // Parametros da Task
               configMAX_PRIORITIES - 8, // Prioridade da Task (quanto maior o valor, maior a prioridade)
               &wifi_handle);            // Handler da Task (para que outras tasks ou funcoes da freeRTOS possam se comunicar com esta task)
+  /* Faz a primeira sincronizacao do relogio e nao inicia o monitoramento enquanto nao estiver sincronizado */
+  configTime(GMT_OFFSET, HOR_VERAO, NTP_SERVER);
+  do {
+    time(&seg);
+    timeinfo = localtime(&seg);
+    if (timeinfo->tm_year+1900 < 2020)
+      vTaskDelay(250/portTICK_PERIOD_MS);
+  } while (timeinfo->tm_year+1900 < 2020);
   xTaskCreate(http_task,  "HTTP_Task",  1024*4, NULL, configMAX_PRIORITIES -  9, &http_handle);
+  xTaskCreate(led_task,   "LED_Task",   1024*2, NULL, configMAX_PRIORITIES -  15, NULL);
   xTaskCreate(lcd_task,   "LCD_Task",   1024*4, NULL, configMAX_PRIORITIES -  9, &lcd_handle);
   xTaskCreate(time_task,  "Time_Task",  1024*2, NULL, configMAX_PRIORITIES -  9, NULL);
   if(used_rele[0])  // Inicializa apenas as tasks com reles ativos
@@ -382,7 +394,6 @@ void conf_task (void *pvParameters)
         Serial.printf("SSID: %s\nSenha: %s\n\n", nome_maq.c_str(), AP_PASS);
       }
       IPAddress IP = WiFi.softAPIP(); // Gera o endereco IP do ESP32
-      lcd.clear();
       lcd.setCursor(0, 0);
       lcd.print("MODO CONF LIGADO");
       sprintf(aux, "%16s", IP.toString().c_str());
@@ -445,7 +456,6 @@ void conf_task (void *pvParameters)
       conf.print(",");            conf.println(rele_nick[5]);
 
       conf.close();             // Fecha o arquivo
-      lcd.clear();
       lcd.setCursor(0, 0);
       lcd.print(" CONFIG SALVAS  ");
       if (serial_debug)
@@ -550,6 +560,7 @@ void http_task (void *pvParameters)
         ftemp.close();
         SD.remove(TEMP_DIR);
       } else {
+        ftemp.rewindDirectory();
         while(1)                            // Se mantem em um loop ate sair por um break em uma condicao abaixo
         {
           aux = ftemp.readStringUntil('\n');  // Le ate a quebra de linha
@@ -611,16 +622,6 @@ void http_task (void *pvParameters)
 
 void lcd_task (void *pvParameters)
 {
-  /* Exibe a mensagem padrao no LCD */
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(" ZZTECH MONITOR ");
-  lcd.setCursor(0, 1);
-  if (!def_msg)
-    lcd.print("NAO CONFIGURADO ");
-  else
-    lcd.print("                ");
-
   bool lcd_flag = 0;  // Flag para indicar quando a mensagem padrao deve ser exibida
   while (1)
   {
@@ -628,7 +629,6 @@ void lcd_task (void *pvParameters)
       lcd_flag = 1;   // Ativa a flag quando passar 3 segundos desde que o timer foi acionado
     if (lcd_flag)     // Se a flag estiver ativa, exibe a mensagem padrao
     {
-      lcd.clear();
       lcd.setCursor(0, 0);
       lcd.print(" ZZTECH MONITOR ");
       lcd.setCursor(0, 1);
@@ -678,13 +678,13 @@ void r0_task (void *pvParameters)
   /* Inicializa o pino com instrucoes proprias da espressif */
   gpio_config_t io_conf = {
       .pin_bit_mask = (uint64_t)(1ULL << pin[ind]),
-      .mode = GPIO_MODE_INPUT_OUTPUT,
+      .mode = GPIO_MODE_INPUT,
       .pull_up_en = GPIO_PULLUP_DISABLE,
       .pull_down_en = GPIO_PULLDOWN_DISABLE,
       .intr_type = GPIO_INTR_DISABLE,
   };
   gpio_config(&io_conf);    // Tudo isso equivale a pinMode(pin[ind], OUTPUT)
-  char temp[2000];            // String auxiliar para mostrar informacoes no d20ay
+  char temp[20];            // String auxiliar para mostrar informacoes no d20ay
   while(1)
   {
     if (!gpio_get_level((gpio_num_t)pin[ind]))  // Caso a leitura do pino seja LOW
@@ -692,7 +692,7 @@ void r0_task (void *pvParameters)
       est_rele[ind] = 0;
       marcaOff[ind] = millis();     // Armazena o momento em que o rele foi desativado
       time(&seg);                   // Armazena a data e hora atuais em segundos
-      timeinfo = localtime(&seg);   // Converte a data e hora para uma struct que premite a leitura mais dinamica das informacoes de data e hora// Armazena as informacoes de data e hora na string auxiliar
+      timeinfo = localtime(&seg);   // Con
       sprintf(temp, "%02d/%02d/%04d-%02d:%02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
       String aux;                   // String para escrever no arquivo
       if (!ini_flag[ind]) {
@@ -708,11 +708,10 @@ void r0_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
-        if(marcaOff[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS); // Verifica se uma mensagem não acabou de ser exibida no lcd. Caso tenha, aguarda um pequeno tempo
+        if(marcaOff[ind] - lcd_timer < 300) vTaskDelay(300/portTICK_PERIOD_MS); // Verifica se uma mensagem não acabou de ser exibida no lcd. Caso tenha, aguarda um pequeno tempo
         lcd_timer = marcaOff[ind];  // Atribui esse tempo para o timer do LCD (isso indicara para a task do LCD que ele deve esperar o tempo de timeout antes de exibir a mensagem padrao novamente)
-        lcd.clear();                // E exibe a informacao de que o rele foi desativado, bem como o horario de sua desativacao
         lcd.setCursor(0,0);
-        lcd.print("R0 Desativado");
+        lcd.print(" R0 DESATIVADO  ");
         lcd.setCursor(0,1);
         lcd.print(temp);
       }
@@ -739,11 +738,10 @@ void r0_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
-        if(marcaOn[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
+        if(marcaOn[ind] - lcd_timer < 300) vTaskDelay(300/portTICK_PERIOD_MS);
         lcd_timer = marcaOn[ind];
-        lcd.clear();
         lcd.setCursor(0,0);
-        lcd.print("R0 Reativado");
+        lcd.print("   R0 ATIVADO   ");
         lcd.setCursor(0, 1);
         lcd.print(temp);
       }
@@ -758,7 +756,7 @@ void r1_task (void *pvParameters)
   int ind = 1;
   gpio_config_t io_conf = {
       .pin_bit_mask = (uint64_t)(1ULL << pin[ind]),
-      .mode = GPIO_MODE_INPUT_OUTPUT,
+      .mode = GPIO_MODE_INPUT,
       .pull_up_en = GPIO_PULLUP_DISABLE,
       .pull_down_en = GPIO_PULLDOWN_DISABLE,
       .intr_type = GPIO_INTR_DISABLE,
@@ -788,11 +786,10 @@ void r1_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
-        if(marcaOff[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
+        if(marcaOff[ind] - lcd_timer < 300) vTaskDelay(300/portTICK_PERIOD_MS);
         lcd_timer = marcaOff[ind];
-        lcd.clear();
         lcd.setCursor(0,0);
-        lcd.print("R1 Desativado");
+        lcd.print(" R1 DESATIVADO  ");
         lcd.setCursor(0,1);
         lcd.print(temp);
       }
@@ -819,11 +816,10 @@ void r1_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
-        if(marcaOn[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
+        if(marcaOn[ind] - lcd_timer < 300) vTaskDelay(300/portTICK_PERIOD_MS);
         lcd_timer = marcaOn[ind];
-        lcd.clear();
         lcd.setCursor(0,0);
-        lcd.print("R1 Reativado");
+        lcd.print("   R1 ATIVADO   ");
         lcd.setCursor(0, 1);
         lcd.print(temp);
       }
@@ -838,7 +834,7 @@ void r2_task (void *pvParameters)
   int ind = 2;
   gpio_config_t io_conf = {
       .pin_bit_mask = (uint64_t)(1ULL << pin[ind]),
-      .mode = GPIO_MODE_INPUT_OUTPUT,
+      .mode = GPIO_MODE_INPUT,
       .pull_up_en = GPIO_PULLUP_DISABLE,
       .pull_down_en = GPIO_PULLDOWN_DISABLE,
       .intr_type = GPIO_INTR_DISABLE,
@@ -868,11 +864,10 @@ void r2_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
-        if(marcaOff[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
+        if(marcaOff[ind] - lcd_timer < 300) vTaskDelay(300/portTICK_PERIOD_MS);
         lcd_timer = marcaOff[ind];
-        lcd.clear();
         lcd.setCursor(0,0);
-        lcd.print("R2 Desativado");
+        lcd.print(" R2 DESATIVADO  ");
         lcd.setCursor(0,1);
         lcd.print(temp);
       }
@@ -899,11 +894,10 @@ void r2_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
-        if(marcaOn[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
+        if(marcaOn[ind] - lcd_timer < 300) vTaskDelay(300/portTICK_PERIOD_MS);
         lcd_timer = marcaOn[ind];
-        lcd.clear();
         lcd.setCursor(0,0);
-        lcd.print("R2 Reativado");
+        lcd.print("   R2 ATIVADO   ");
         lcd.setCursor(0, 1);
         lcd.print(temp);
       }
@@ -918,7 +912,7 @@ void r3_task (void *pvParameters)
   int ind = 3;
   gpio_config_t io_conf = {
       .pin_bit_mask = (uint64_t)(1ULL << pin[ind]),
-      .mode = GPIO_MODE_INPUT_OUTPUT,
+      .mode = GPIO_MODE_INPUT,
       .pull_up_en = GPIO_PULLUP_DISABLE,
       .pull_down_en = GPIO_PULLDOWN_DISABLE,
       .intr_type = GPIO_INTR_DISABLE,
@@ -948,11 +942,10 @@ void r3_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
-        if(marcaOff[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
+        if(marcaOff[ind] - lcd_timer < 300) vTaskDelay(300/portTICK_PERIOD_MS);
         lcd_timer = marcaOff[ind];
-        lcd.clear();
         lcd.setCursor(0,0);
-        lcd.print("R3 Desativado");
+        lcd.print(" R3 DESATIVADO  ");
         lcd.setCursor(0,1);
         lcd.print(temp);
       }
@@ -979,11 +972,10 @@ void r3_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
-        if(marcaOn[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
+        if(marcaOn[ind] - lcd_timer < 300) vTaskDelay(300/portTICK_PERIOD_MS);
         lcd_timer = marcaOn[ind];
-        lcd.clear();
         lcd.setCursor(0,0);
-        lcd.print("R3 Reativado");
+        lcd.print("   R3 ATIVADO   ");
         lcd.setCursor(0, 1);
         lcd.print(temp);
       }
@@ -998,7 +990,7 @@ void r4_task (void *pvParameters)
   int ind = 4;
   gpio_config_t io_conf = {
       .pin_bit_mask = (uint64_t)(1ULL << pin[ind]),
-      .mode = GPIO_MODE_INPUT_OUTPUT,
+      .mode = GPIO_MODE_INPUT,
       .pull_up_en = GPIO_PULLUP_DISABLE,
       .pull_down_en = GPIO_PULLDOWN_DISABLE,
       .intr_type = GPIO_INTR_DISABLE,
@@ -1028,11 +1020,10 @@ void r4_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
-        if(marcaOff[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
+        if(marcaOff[ind] - lcd_timer < 300) vTaskDelay(300/portTICK_PERIOD_MS);
         lcd_timer = marcaOff[ind];
-        lcd.clear();
         lcd.setCursor(0,0);
-        lcd.print("R4 Desativado");
+        lcd.print(" R4 DESATIVADO  ");
         lcd.setCursor(0,1);
         lcd.print(temp);
       }
@@ -1059,11 +1050,10 @@ void r4_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
-        if(marcaOn[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
+        if(marcaOn[ind] - lcd_timer < 300) vTaskDelay(300/portTICK_PERIOD_MS);
         lcd_timer = marcaOn[ind];
-        lcd.clear();
         lcd.setCursor(0,0);
-        lcd.print("R4 Reativado");
+        lcd.print("   R4 ATIVADO   ");
         lcd.setCursor(0, 1);
         lcd.print(temp);
       }
@@ -1078,7 +1068,7 @@ void r5_task (void *pvParameters)
   int ind = 5;
   gpio_config_t io_conf = {
       .pin_bit_mask = (uint64_t)(1ULL << pin[ind]),
-      .mode = GPIO_MODE_INPUT_OUTPUT,
+      .mode = GPIO_MODE_INPUT,
       .pull_up_en = GPIO_PULLUP_DISABLE,
       .pull_down_en = GPIO_PULLDOWN_DISABLE,
       .intr_type = GPIO_INTR_DISABLE,
@@ -1108,11 +1098,10 @@ void r5_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
-        if(marcaOff[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
+        if(marcaOff[ind] - lcd_timer < 300) vTaskDelay(300/portTICK_PERIOD_MS);
         lcd_timer = marcaOff[ind];
-        lcd.clear();
         lcd.setCursor(0,0);
-        lcd.print("R5 Desativado");
+        lcd.print(" R5 DESATIVADO  ");
         lcd.setCursor(0,1);
         lcd.print(temp);
       }
@@ -1139,11 +1128,10 @@ void r5_task (void *pvParameters)
         Serial.println(aux);
       sprintf(temp, "%02d/%02d/%04d %02d:%02d", timeinfo->tm_mday, timeinfo->tm_mon+1, timeinfo->tm_year+1900, timeinfo->tm_hour, timeinfo->tm_min);
       if (!suspended) {
-        if(marcaOn[ind] - lcd_timer < 150) vTaskDelay(150/portTICK_PERIOD_MS);
+        if(marcaOn[ind] - lcd_timer < 300) vTaskDelay(300/portTICK_PERIOD_MS);
         lcd_timer = marcaOn[ind];
-        lcd.clear();
         lcd.setCursor(0,0);
-        lcd.print("R5 Reativado");
+        lcd.print("   R5 ATIVADO   ");
         lcd.setCursor(0, 1);
         lcd.print(temp);
       }
